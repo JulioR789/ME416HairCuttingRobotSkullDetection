@@ -1,0 +1,6 @@
+﻿* text=auto
+*.pkl binary
+*.npz binary
+*.bin binary
+*.stl binary
+*.jpg binary

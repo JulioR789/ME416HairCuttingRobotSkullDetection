@@ -1,0 +1,16 @@
+{
+  "grid_size": 64,
+  "domain_mm": 260.0,
+  "voxel_step_mm": 4.127,
+  "origin_min_mm": [
+    -129.992,
+    -151.927,
+    -161.481
+  ],
+  "centroid_mm": [
+    0.008,
+    -21.927,
+    -31.481
+  ],
+  "unit_scale_mm": 0.1
+}
