@@ -13,6 +13,8 @@ from mediapipe.tasks.python import vision as mp_vision
 import trimesh
 from scipy.spatial import cKDTree
 
+import zones
+
 # ==========================================
 # 0. MOCK CHUMPY SO LEGACY .PKL LOADS CLEANLY
 # ==========================================
@@ -63,7 +65,7 @@ SAFETY_BUFFER_MM = 3.0
 NUM_SHAPE_PCS = 20
 BETA_CLAMP = 1.8
 SDF_GRID_SIZE = 64
-SDF_DOMAIN_MM = 260.0
+SDF_DOMAIN_MM = 300.0  # scalp is ~260 mm tall; leave clearance above the crown for the cutter
 
 
 # ==========================================
@@ -216,7 +218,18 @@ def extract_2d_landmarks(image_path, mp_indices, view_name, detector):
 # ==========================================
 # 5. INTERACTIVE POINT CLICKING HELPERS
 # ==========================================
-def click_points(img_path, prompt_title, num_points=2):
+CLICKS_IN = {}   # clicks loaded via --clicks (skips the OpenCV windows)
+CLICKS_OUT = {}  # every click made this run, saved to output/clicks.json
+
+
+def click_points(img_path, prompt_title, num_points=2, key=None):
+    key = key or img_path
+    if key in CLICKS_IN:
+        pts = [np.array(c, dtype=np.float32) for c in CLICKS_IN[key]]
+        print(f"\n[CLICKS] Reusing saved points for '{key}': {[p.tolist() for p in pts]}")
+        CLICKS_OUT[key] = [p.tolist() for p in pts]
+        return pts
+
     img = cv2.imread(img_path)
     display_img = img.copy()
     clicks = []
@@ -245,6 +258,10 @@ def click_points(img_path, prompt_title, num_points=2):
 
     if len(clicks) != num_points:
         raise ValueError(f"Please click exactly {num_points} point(s) before pressing a key.")
+    CLICKS_OUT[key] = [[float(c[0]), float(c[1])] for c in clicks]
+    os.makedirs("output", exist_ok=True)
+    with open("output/clicks.json", "w") as f:
+        json.dump(CLICKS_OUT, f, indent=2)
     return [np.array(c, dtype=np.float32) for c in clicks]
 
 
@@ -252,13 +269,17 @@ def click_points(img_path, prompt_title, num_points=2):
 # 6. PERSPECTIVE PINHOLE CAMERA PROJECTION
 # ==========================================
 def rodrigues_matrix(rot_vec):
-    theta = torch.norm(rot_vec) + 1e-8
+    # Smooth norm (no NaN gradient at 0). K must be built with torch.stack, not
+    # torch.tensor: torch.tensor copies values and silently detaches them from
+    # autograd, which froze the rotation axis and any rotation starting at zero.
+    theta = torch.sqrt(torch.sum(rot_vec ** 2) + 1e-12)
     k = rot_vec / theta
-    K = torch.tensor([
-        [0.0, -k[2], k[1]],
-        [k[2], 0.0, -k[0]],
-        [-k[1], k[0], 0.0]
-    ], dtype=rot_vec.dtype, device=rot_vec.device)
+    zero = torch.zeros((), dtype=rot_vec.dtype, device=rot_vec.device)
+    K = torch.stack([
+        torch.stack([zero, -k[2], k[1]]),
+        torch.stack([k[2], zero, -k[0]]),
+        torch.stack([-k[1], k[0], zero]),
+    ])
     return torch.eye(3, dtype=rot_vec.dtype, device=rot_vec.device) + torch.sin(theta) * K + (1.0 - torch.cos(theta)) * (K @ K)
 
 
@@ -316,12 +337,17 @@ def compute_initial_perspective_camera(lm3d_init, pts_2d, weights, yaw_rad, img_
 def save_mesh_overlay_visualization(img, vertices_3d, faces_np, focal_px, R_mat, trans_3d, principal_pt, out_path):
     with torch.no_grad():
         proj_verts = project_perspective_matrix(vertices_3d, focal_px, R_mat, trans_3d, principal_pt).cpu().numpy()
+        cam_pts = (vertices_3d @ R_mat.T + trans_3d).cpu().numpy()
 
     overlay = img.copy()
     pts_int = np.round(proj_verts).astype(np.int32)
 
+    # Hidden-surface removal (back-face culling + painter's ID buffer) so the
+    # far side of the head (face, eyeballs, mouth) doesn't show through.
+    _, visible = zones.visible_face_ids(cam_pts, pts_int, faces_np, img.shape)
+
     wire_layer = img.copy()
-    for tri in faces_np:
+    for tri in faces_np[visible]:
         p0, p1, p2 = pts_int[tri[0]], pts_int[tri[1]], pts_int[tri[2]]
         cv2.line(wire_layer, tuple(p0), tuple(p1), (255, 200, 0), 1, cv2.LINE_AA)
         cv2.line(wire_layer, tuple(p1), tuple(p2), (255, 200, 0), 1, cv2.LINE_AA)
@@ -334,9 +360,15 @@ def save_mesh_overlay_visualization(img, vertices_3d, faces_np, focal_px, R_mat,
 # ==========================================
 # 8. LOW-MEMORY SDF EXPORTER FOR ESP32-S3
 # ==========================================
-def export_esp32_sdf(mesh, out_bin_path, out_meta_path):
-    center = mesh.bounding_box.centroid
+def export_esp32_sdf(mesh, out_bin_path, out_meta_path, focus_indices=None):
+    # Centre the grid on the scalp (the cutting region), not the whole mesh:
+    # FLAME's neck/shoulder flare makes the full mesh ~315 mm tall, so a
+    # bbox-centred 260 mm cube would clip the crown.
+    focus = mesh.vertices if focus_indices is None else mesh.vertices[focus_indices]
+    center = 0.5 * (focus.min(axis=0) + focus.max(axis=0))
     half = SDF_DOMAIN_MM / 2.0
+    if np.any(np.abs(focus - center) > half):
+        print(f"[WARNING] Scalp extends beyond the {SDF_DOMAIN_MM:.0f} mm SDF domain; increase SDF_DOMAIN_MM.")
     lin = np.linspace(-half, half, SDF_GRID_SIZE, dtype=np.float32)
     gx, gy, gz = np.meshgrid(lin + center[0], lin + center[1], lin + center[2], indexing="ij")
     grid_pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
@@ -366,6 +398,7 @@ def export_esp32_sdf(mesh, out_bin_path, out_meta_path):
         json.dump(meta, f, indent=2)
 
     print(f"Exported 512 KB ESP32-S3 SDF lookup table: {out_bin_path}")
+    return meta
 
 
 # ==========================================
@@ -386,14 +419,26 @@ def fit_multiview_flame():
     flame = PurePyTorchFLAMESkull(MODEL_PATH, MASKS_PATH, NUM_SHAPE_PCS, DEVICE)
     mp_indices, lmk_face_idx, lmk_b_coords = load_mediapipe_embedding(MP_EMBEDDING_PATH, DEVICE)
 
+    # Near-profile shots often fall below the 0.4 threshold; retry those at 0.2
+    fallback_options = mp_vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        num_faces=1,
+        min_face_detection_confidence=0.2,
+        min_face_presence_confidence=0.2,
+    )
+
     view_data = {}
-    with mp_vision.FaceLandmarker.create_from_options(options) as detector:
+    with mp_vision.FaceLandmarker.create_from_options(options) as detector, \
+         mp_vision.FaceLandmarker.create_from_options(fallback_options) as fallback_detector:
         for view_name in ["front", "left", "right"]:
             path = IMAGE_PATHS[view_name]
             if not os.path.exists(path):
                 print(f"[WARNING] Missing {path}, skipping {view_name} view.")
                 continue
             pts, weights, (h, w), raw_img = extract_2d_landmarks(path, mp_indices, view_name, detector)
+            if pts is None:
+                print(f"[INFO] No face in {path} at confidence 0.4, retrying at 0.2...")
+                pts, weights, (h, w), raw_img = extract_2d_landmarks(path, mp_indices, view_name, fallback_detector)
             if pts is not None:
                 view_data[view_name] = {
                     "pts": torch.tensor(pts, dtype=torch.float32, device=DEVICE),
@@ -414,7 +459,8 @@ def fit_multiview_flame():
             [pt_ear, pt_nape] = click_points(
                 IMAGE_PATHS[side],
                 f"{side.capitalize()}: Click (1) Front Ear Notch, then (2) Back of Neck Hairline, then ANY KEY",
-                num_points=2
+                num_points=2,
+                key=side,
             )
             view_data[side]["ear_pt"] = torch.tensor(pt_ear, dtype=torch.float32, device=DEVICE)
             view_data[side]["nape_pt"] = torch.tensor(pt_nape, dtype=torch.float32, device=DEVICE)
@@ -567,13 +613,15 @@ def fit_multiview_flame():
             cv2.imwrite(f"output/debug_fit_{v}.jpg", vis)
 
     # Generate 4th overlay for Back.jpg matching the outer middle ear edges
+    back_cam = None
     if os.path.exists(IMAGE_PATHS["back"]):
         back_img = cv2.imread(IMAGE_PATHS["back"])
         bh, bw, _ = back_img.shape
         [back_l_ear, back_r_ear] = click_points(
             IMAGE_PATHS["back"],
             "Back: Click OUTER MIDDLE edge of LEFT ear, then RIGHT ear, then ANY KEY",
-            num_points=2
+            num_points=2,
+            key="back",
         )
         with torch.no_grad():
             f_back = torch.tensor([float(bh) * 0.88], dtype=torch.float32, device=DEVICE)
@@ -607,6 +655,7 @@ def fit_multiview_flame():
             save_mesh_overlay_visualization(
                 back_img, neutral_vertices, flame.faces, f_back, R_b, t_back, pp_back, "output/overlay_back.jpg"
             )
+            back_cam = {"img": back_img, "focal": f_back, "R": R_b, "trans": t_back, "pp": pp_back}
 
     print("\nSaved all 4 diagnostic overlays:")
     print("  - output/overlay_front.jpg")
@@ -620,17 +669,34 @@ def fit_multiview_flame():
     c_left, c_right = click_points(
         IMAGE_PATHS["front"],
         "Front: Click LEFT edge then RIGHT edge of ID Card, then press ANY KEY",
-        num_points=2
+        num_points=2,
+        key="card",
     )
     pixel_dist = np.linalg.norm(c_left - c_right)
     mm_per_pixel = CARD_REAL_WIDTH_MM / pixel_dist
 
     with torch.no_grad():
-        R_front = rodrigues_matrix(cam_params["front"]["rot"])
-        cam_verts = neutral_vertices @ R_front.T + cam_params["front"]["trans"]
-        brow_z_m = abs(cam_verts[flame.scalp_indices].min(dim=0)[0][2].item())
-        focal_front = cam_params["front"]["focal"].item()
-        mm_per_flame_unit = (focal_front / brow_z_m) * mm_per_pixel
+        # The card's mm-per-pixel only holds at the card's own depth, i.e. the
+        # forehead surface right under it. Find the mesh vertices that project
+        # onto the card and take the nearest one to the camera (the visible
+        # surface the card rests on). The old code took the scalp's *farthest*
+        # point (.min() of camera z = back of the head), which inflated the scale.
+        fp = cam_params["front"]
+        verts_front = flame.forward(active_shape, head_rel_neck_rot=view_data["front"]["neck_rot"])
+        R_front = rodrigues_matrix(fp["rot"])
+        cam_verts = verts_front @ R_front.T + fp["trans"]
+        depths = -cam_verts[:, 2]
+        proj_front = project_perspective_matrix(verts_front, fp["focal"], R_front, fp["trans"], fp["pp"])
+        card_mid = torch.tensor(0.5 * (c_left + c_right), dtype=torch.float32, device=DEVICE)
+        under_card = torch.norm(proj_front - card_mid, dim=1) < 0.25 * float(pixel_dist)
+        if under_card.any():
+            card_depth = depths[under_card].min().item()
+        else:
+            print("[WARNING] Card midpoint does not land on the mesh; using nearest scalp depth.")
+            card_depth = depths[flame.scalp_indices].min().item()
+        focal_front = fp["focal"].item()
+        mm_per_flame_unit = (focal_front / card_depth) * mm_per_pixel
+        print(f"Card: {pixel_dist:.1f} px wide -> {mm_per_pixel:.4f} mm/px at depth {card_depth:.4f} FLAME units")
 
     print(f"Scale factor: {mm_per_flame_unit:.1f} mm per FLAME unit")
 
@@ -647,8 +713,43 @@ def fit_multiview_flame():
     print(f"\nSUCCESS: Exported smooth metric 3D skull mesh to: {stl_path}")
     print(f"Fitted Head Dimensions (Width x Height x Depth in mm): {mesh.extents.round(1)}")
 
-    export_esp32_sdf(mesh, "output/skull_sdf_64x64x64.bin", "output/skull_sdf_meta.json")
+    sdf_meta = export_esp32_sdf(mesh, "output/skull_sdf_64x64x64.bin", "output/skull_sdf_meta.json",
+                                focus_indices=flame.scalp_indices)
+
+    # ==========================================
+    # 12. FLOWBEE CUTTING ZONES (see zones.py / zones_config.json)
+    # ==========================================
+    print("\nSegmenting Flowbee cutting zones...")
+    zone_cfg = zones.load_zone_config()
+    seg = zones.segment_zones(np.asarray(mesh.vertices), flame, zone_cfg)
+    zones.export_zone_outputs(seg, zone_cfg, sdf_meta)
+
+    # Zone overlays on each photo, using the same per-view poses as the fit
+    with torch.no_grad():
+        views = []
+        for v, data in view_data.items():
+            verts_v = flame.forward(active_shape, head_rel_neck_rot=data["neck_rot"])
+            cp = cam_params[v]
+            views.append((v, data["img"], verts_v, cp["focal"], rodrigues_matrix(cp["rot"]), cp["trans"], cp["pp"]))
+        if back_cam is not None:
+            views.append(("back", back_cam["img"], neutral_vertices, back_cam["focal"], back_cam["R"],
+                          back_cam["trans"], back_cam["pp"]))
+        for v, img, verts_v, focal, R_v, t_v, pp_v in views:
+            sub = torch.tensor(seg["S"] @ verts_v.cpu().numpy().astype(np.float64),
+                               dtype=torch.float32, device=DEVICE)
+            pts2d = project_perspective_matrix(sub, focal, R_v, t_v, pp_v).cpu().numpy()
+            cam_pts = (sub @ R_v.T + t_v).cpu().numpy()
+            zones.save_zone_overlay(img, cam_pts, pts2d, seg, zone_cfg, f"output/zones_{v}.jpg")
+    print("Saved zone overlays: " + ", ".join(f"output/zones_{v[0]}.jpg" for v in views))
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Multi-view FLAME skull fit + ESP32 SDF export")
+    parser.add_argument("--clicks", help="Reuse calibration clicks from a JSON file (e.g. output/clicks.json) "
+                                         "instead of opening the click windows")
+    args = parser.parse_args()
+    if args.clicks:
+        with open(args.clicks) as f:
+            CLICKS_IN.update(json.load(f))
     fit_multiview_flame()

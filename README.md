@@ -55,9 +55,33 @@ ME416HairCuttingRobotSkullDetection/
 
 ---
 
-## Next Stage: Cutting Zone Segmentation *(In Progress)*
-- Partition the fitted scalp mesh into **Top/Crown**, **Left Side**, **Right Side**, **Back/Occipital**, and **No-Cut** regions (face, ears, neck).
-- Map per-zone target hair lengths (`mm`) to maximum cutter extension bounds in the SDF lookup table.
+## Cutting Zones (Flowbee)
+
+`zones.py` runs at the end of `fit_skull.py` and splits the fitted scalp into haircut zones, each with its own target hair length (Flowbee spacer / actuator setting). Boundaries follow the fitted anatomy:
+
+| id | Zone | Boundary | Default |
+|---|---|---|---|
+| 0 | `NO_CUT` | face, forehead, ears, neck below the nape hairline (plane through the clicked nape point and both ear lobes) | no cut |
+| 1 | `TOP` | surface tilted > 25° upward (parietal ridge) + front hairline | 25 mm |
+| 2 / 3 | `LEFT` / `RIGHT` | subject's left / right, in front of the back edge of the ear | 12 mm |
+| 4 | `BACK` | behind the ears, above tragus height | 12 mm |
+| 5 | `NAPE` | behind the ears, below tragus height (taper) | 6 mm |
+| 6 | `EAR_GUARD` | 10 mm band around each ear | no cut |
+
+Edit **`zones_config.json`** (created on first run) to change lengths, enable/disable zones, or move boundaries (`top_min_elevation_deg`, `back_plane_offset_mm`, `nape_top_offset_mm`, `ear_guard_mm`). Lengths are blended over `blend_mm` across zone borders so the actuator steps smoothly.
+
+> Note: `LeftSide.jpg` (nose pointing image-right) shows the subject's **right** side, so it is coloured `RIGHT`.
+
+**Outputs** (same 64³ grid, origin, step and index order as the SDF — `flat = ix*N*N + iy*N + iz`):
+- `output/skull_zone_64x64x64.bin` — `uint8` zone id per voxel (nearest scalp surface)
+- `output/skull_length_64x64x64.bin` — `uint8` blended target length in mm, `255` = do not cut
+- `output/skull_zones_meta.json` — zone table, areas, landmarks
+- `output/skull_zones.ply` — colour-coded mesh (MeshLab / Blender)
+- `output/zones_{front,left,right,back}.jpg` — zone overlays for checking boundaries
+
+**Firmware lookup per cutter position:** `sdf <= 0` → retract; `length == 255` → trimmer off; otherwise set the spacer/actuator to `length` mm.
+
+Re-run without the click windows using saved clicks: `python fit_skull.py --clicks output/clicks.json`.
 
 ---
 

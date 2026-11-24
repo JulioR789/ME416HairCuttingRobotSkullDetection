@@ -2,3 +2,5 @@
 *.pyc
 .vscode/
 model/*.task
+.venv/
+.DS_Store

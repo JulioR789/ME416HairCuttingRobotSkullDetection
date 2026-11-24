@@ -1,0 +1,54 @@
+{
+  "_help": "Haircut zones for the Flowbee. length_mm = target hair length (spacer setting). cut=false means the trimmer must stay off in that zone. Angles in degrees, distances in mm.",
+  "top_min_elevation_deg": 25.0,
+  "normal_smoothing_mm": 20.0,
+  "front_max_azimuth_deg": 50.0,
+  "back_plane_offset_mm": 0.0,
+  "nape_top_offset_mm": 0.0,
+  "ear_guard_mm": 10.0,
+  "blend_mm": 15.0,
+  "zones": {
+    "NO_CUT": {
+      "id": 0,
+      "cut": false,
+      "length_mm": null,
+      "color": "#3c3c3c"
+    },
+    "TOP": {
+      "id": 1,
+      "cut": true,
+      "length_mm": 25.0,
+      "color": "#ffc800"
+    },
+    "LEFT": {
+      "id": 2,
+      "cut": true,
+      "length_mm": 12.0,
+      "color": "#00c850"
+    },
+    "RIGHT": {
+      "id": 3,
+      "cut": true,
+      "length_mm": 12.0,
+      "color": "#0096ff"
+    },
+    "BACK": {
+      "id": 4,
+      "cut": true,
+      "length_mm": 12.0,
+      "color": "#c800c8"
+    },
+    "NAPE": {
+      "id": 5,
+      "cut": true,
+      "length_mm": 6.0,
+      "color": "#ff3232"
+    },
+    "EAR_GUARD": {
+      "id": 6,
+      "cut": false,
+      "length_mm": null,
+      "color": "#ffffff"
+    }
+  }
+}
